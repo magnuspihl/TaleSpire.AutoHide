@@ -274,13 +274,24 @@ namespace AutoHide
 
                 lock (_zoneMasks)
                 {
-                    if (!_zoneMasks.TryGetValue(zone.Coord, out var buf))
+                    // Rebuilding a zone tears down and re-adds its volumes and dirties the
+                    // zone's presentation. Most moves leave most zones' visibility untouched,
+                    // so only rebuild the ones whose mask actually changed.
+                    bool changed = !_zoneMasks.TryGetValue(zone.Coord, out var buf);
+                    if (changed)
                     {
                         buf = new ushort[MASK_LENGTH];
                         _zoneMasks[zone.Coord] = buf;
                     }
-                    for (int i = 0; i < MASK_LENGTH; i++) buf[i] = mask[i];
-                    _dirtyZones.Add(zone.Coord);
+
+                    for (int i = 0; i < MASK_LENGTH; i++)
+                    {
+                        if (buf[i] == mask[i]) continue;
+                        buf[i] = mask[i];
+                        changed = true;
+                    }
+
+                    if (changed) _dirtyZones.Add(zone.Coord);
                 }
             }
             catch (Exception ex)
