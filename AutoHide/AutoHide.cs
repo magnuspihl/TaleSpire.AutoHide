@@ -10,6 +10,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using Unity.Collections;
 using Unity.Jobs;
+using Unity.Mathematics;
 using UnityEngine;
 
 namespace AutoHide
@@ -28,8 +29,13 @@ namespace AutoHide
         private ConfigEntry<KeyboardShortcut> _probeTeleportKey;
         private ConfigEntry<KeyboardShortcut> _probeRefreshKey;
         private ConfigEntry<string> _probePosition;
+        private static ConfigEntry<bool> _rememberSeenTerrain;
         private ConfigEntry<KeyboardShortcut> _boardVolumeCensusKey;
         private ConfigEntry<KeyboardShortcut> _boardVolumePurgeKey;
+        private ConfigEntry<KeyboardShortcut> _gmBlockToggleKey;
+        private ConfigEntry<KeyboardShortcut> _gmBlockCensusKey;
+        private ConfigEntry<KeyboardShortcut> _gmBlockMemoryKey;
+        private ConfigEntry<KeyboardShortcut> _gmBlockFogResetKey;
 
         private Harmony _harmony;
 
@@ -55,6 +61,10 @@ namespace AutoHide
         private static readonly Dictionary<short3, List<HideVolume>> _zoneHideVolumes = new Dictionary<short3, List<HideVolume>>();
         private static int _rebuildLogCount;
         private int _pendingInitialRefresh;
+        private int _lastBoardEventCounter;
+        private const float REMOTE_CHANGE_DEBOUNCE = 0.25f;
+        private static bool _remoteScriptStatePending;
+        private float _nextRemoteChangeTime;
         private static ViewPointManager.ViewMapRef _lastViewMapRef;
         private static bool _hasLastViewMapRef;
 
@@ -117,6 +127,30 @@ namespace AutoHide
                 "Remove EVERY hide volume stored on the board, dumping each one to the log first. "
                 + "Recovery tool for a board polluted by an earlier build of this plugin — it also "
                 + "deletes hand-placed hide volumes, so it ships unbound.");
+
+            // The GM block is the board-level switch: while one is present, every client with
+            // the plugin runs line-of-sight hiding, with no per-player toggling.
+            _gmBlockToggleKey = Config.Bind("Controls", "GmBlockToggle",
+                new KeyboardShortcut(KeyCode.G, KeyCode.LeftControl),
+                "Arm or disarm line-of-sight hiding for the whole board, by placing or removing an "
+                + "AutoHide GM block at the selected creature. GM only — it writes to the board.");
+            _gmBlockMemoryKey = Config.Bind("Controls", "GmBlockToggleMemory",
+                new KeyboardShortcut(KeyCode.M, KeyCode.LeftControl),
+                "Flip the seen-terrain memory flag on the AutoHide GM block, for every client on the board");
+            _gmBlockFogResetKey = Config.Bind("Controls", "GmBlockResetFog",
+                new KeyboardShortcut(KeyCode.B, KeyCode.LeftControl),
+                "Forget all seen terrain on every client on the board, by bumping the reset counter "
+                + "on the AutoHide GM block");
+
+            _gmBlockCensusKey = Config.Bind("Diagnostics", "GmBlockCensus",
+                KeyboardShortcut.Empty,
+                "Log every GM block the board carries and whether it is marked as ours");
+
+            _rememberSeenTerrain = Config.Bind("Behaviour", "RememberSeenTerrain", true,
+                "Keep terrain visible once it has been seen, the way fog of war does, instead of "
+                + "re-hiding it when it leaves line of sight. Creatures are unaffected — TaleSpire "
+                + "hides those by its own line of sight. Memory is discarded when tracking is "
+                + "switched off.");
 
             _autoStartTracking = Config.Bind("Diagnostics", "AutoStartTracking", false,
                 "Start LoS tracking automatically once a board is loaded, without needing a keypress. "
@@ -274,20 +308,26 @@ namespace AutoHide
 
                 lock (_zoneMasks)
                 {
-                    // Rebuilding a zone tears down and re-adds its volumes and dirties the
-                    // zone's presentation. Most moves leave most zones' visibility untouched,
-                    // so only rebuild the ones whose mask actually changed.
+                    bool remember = RememberSeenTerrain;
                     bool changed = !_zoneMasks.TryGetValue(zone.Coord, out var buf);
                     if (changed)
                     {
                         buf = new ushort[MASK_LENGTH];
+                        // A remembered mask only ever clears bits, so it has to start fully
+                        // fogged or the zone would be treated as already seen.
+                        if (remember)
+                            for (int i = 0; i < MASK_LENGTH; i++) buf[i] = ushort.MaxValue;
                         _zoneMasks[zone.Coord] = buf;
                     }
 
+                    // Rebuilding a zone tears down and re-adds its volumes and dirties the
+                    // zone's presentation. Most moves leave most zones' visibility untouched,
+                    // so only rebuild the ones whose mask actually changed.
                     for (int i = 0; i < MASK_LENGTH; i++)
                     {
-                        if (buf[i] == mask[i]) continue;
-                        buf[i] = mask[i];
+                        ushort next = remember ? (ushort)(buf[i] & mask[i]) : mask[i];
+                        if (buf[i] == next) continue;
+                        buf[i] = next;
                         changed = true;
                     }
 
@@ -372,27 +412,32 @@ namespace AutoHide
             return true;
         }
 
-        private void ToggleLosTracking()
+        private void ToggleLosTracking() => SetLosTracking(!_losTrackingActive, switchClientMode: true);
+
+        private void SetLosTracking(bool enable, bool switchClientMode)
         {
             try
             {
-                if (_losTrackingActive)
+                if (!enable)
                 {
+                    if (!_losTrackingActive) return;
                     _losTrackingActive = false;
                     RemoveAllZoneHideVolumes();
-                    SwitchToGMMode();
-                    Logger.LogInfo("[AutoHide] [LoS] Tracking OFF — restored GM mode, hide volumes removed.");
+                    if (switchClientMode) SwitchToGMMode();
+                    Logger.LogInfo($"[AutoHide] [LoS] Tracking OFF — hide volumes removed{(switchClientMode ? ", restored GM mode" : "")}.");
                 }
                 else
                 {
+                    if (_losTrackingActive) return;
                     _losTrackingActive = true;
                     _diagnosticTaskCount = 0;
                     _viewCaptureLogCount = 0;
                     _zoneCensusLogCount = 0;
                     EnsureHvManager();
                     EnsureFogMaskManager();
-                    SwitchToPlayerMode();
-                    Logger.LogInfo("[AutoHide] [LoS] Tracking ON — switched to player view for LoS tile hiding.");
+                    _lastBoardEventCounter = BoardSessionManager.Board?.SyncworthyGameEventsCounter ?? 0;
+                    if (switchClientMode) SwitchToPlayerMode();
+                    Logger.LogInfo($"[AutoHide] [LoS] Tracking ON{(switchClientMode ? " — switched to player view" : "")} for LoS tile hiding.");
                     _pendingInitialRefresh = 10;
                 }
             }
@@ -400,6 +445,32 @@ namespace AutoHide
             {
                 Logger.LogWarning($"[AutoHide] [LoS] Toggle: {ex}");
             }
+        }
+
+        // Opening a door bumps Board.SyncworthyGameEventsCounter, which invalidates every
+        // cached view map — but nothing in TaleSpire then asks for a new capture, since it
+        // only does that when a creature moves. Without this the terrain stays hidden as it
+        // was before the door swung. Our own hiding runs through Zone.SetHideVolume rather
+        // than Board, so it does not bump the counter and cannot feed back into this.
+        private void PollBoardChanges()
+        {
+            var board = BoardSessionManager.Board;
+            if (board == null) return;
+
+            // Fold remote script ops into the counter, rate limited: a scripted prop can send
+            // one every frame and each bump costs the whole party a fresh view capture.
+            if (_remoteScriptStatePending && Time.time >= _nextRemoteChangeTime)
+            {
+                _remoteScriptStatePending = false;
+                _nextRemoteChangeTime = Time.time + REMOTE_CHANGE_DEBOUNCE;
+                board.SyncworthyGameEventsCounter++;
+            }
+
+            if (board.SyncworthyGameEventsCounter == _lastBoardEventCounter) return;
+
+            _lastBoardEventCounter = board.SyncworthyGameEventsCounter;
+            Logger.LogInfo($"[AutoHide] [LoS] Board changed (event #{_lastBoardEventCounter}) — refreshing.");
+            ForceLosRefresh();
         }
 
         private void ProbeTeleport()
@@ -548,6 +619,45 @@ namespace AutoHide
             catch (Exception ex) { Logger.LogWarning($"[AutoHide] [StaticHV] {ex}"); }
         }
 
+        // A door someone else opens arrives as a script state op, and unlike the local
+        // Board.SendScriptMessage path that one never bumps SyncworthyGameEventsCounter. The
+        // cached view maps therefore stay "valid" and every client but the one who opened the
+        // door keeps seeing the pre-door line of sight. Bump it so a remote change looks like
+        // a local one; only while tracking is on, so an idle plugin changes nothing.
+        [HarmonyPatch(typeof(Board), "ApplyOp", new[] { typeof(MessageInfo), typeof(ClientGuid), typeof(ScriptStateOp) })]
+        static class PatchRemoteScriptState
+        {
+            static void Postfix(ApplyResult __result)
+            {
+                if (_losTrackingActive && __result == ApplyResult.Ok) _remoteScriptStatePending = true;
+            }
+        }
+
+        // A sector upload copies Zone._localHideVolumes verbatim into the saved board, so any
+        // board change made while tracking is active bakes our line-of-sight boxes in
+        // permanently — a GM who opens a door has polluted their board. Lift ours out for the
+        // duration of the collect and put them straight back: the collect copies the list
+        // synchronously, and the dirty flag Set/RemoveHideVolume raises is only consumed later,
+        // so the restored set is what gets presented and nothing flickers.
+        [HarmonyPatch(typeof(Zone), "CollectDataForSector")]
+        static class PatchZoneCollectDataForSector
+        {
+            static void Prefix(Zone __instance, out List<HideVolume> __state)
+            {
+                __state = null;
+                if (!_zoneHideVolumes.TryGetValue(__instance.Coord, out var ours) || ours.Count == 0) return;
+                foreach (var hv in ours) __instance.RemoveHideVolume(in hv);
+                __state = ours;
+                _log?.LogInfo($"[AutoHide] [Save] Withheld {ours.Count} LoS volume(s) from zone {__instance.Coord}");
+            }
+
+            static void Postfix(Zone __instance, List<HideVolume> __state)
+            {
+                if (__state == null) return;
+                foreach (var hv in __state) __instance.SetHideVolume(in hv, false);
+            }
+        }
+
         // Fires when the perception system finishes a view capture for the controlled creature.
         // Used to trigger FogMaskManager to compute zone-level LoS via the GPU depth cubemap.
         [HarmonyPatch(typeof(CreaturePerceptionManager), "OnViewCaptureReady")]
@@ -657,6 +767,16 @@ namespace AutoHide
             if (_probeRefreshKey.Value.IsDown()) ProbeRefresh();
             if (_boardVolumeCensusKey.Value.IsDown()) LogBoardHideVolumeCensus();
             if (_boardVolumePurgeKey.Value.IsDown()) PurgeBoardHideVolumes();
+            if (_gmBlockToggleKey.Value.IsDown()) ToggleAutoHideGmBlock();
+            if (_gmBlockCensusKey.Value.IsDown()) LogGmBlockCensus();
+            if (_gmBlockMemoryKey.Value.IsDown())
+                SetGmBlockFlags(f => f ^ GM_FLAG_REMEMBER, "toggled seen-terrain memory");
+            if (_gmBlockFogResetKey.Value.IsDown())
+                SetGmBlockFlags(f => (f & ~GM_FLAG_RESET_GEN_MASK)
+                    | ((((f & GM_FLAG_RESET_GEN_MASK) >> GM_FLAG_RESET_GEN_SHIFT) + 1) << GM_FLAG_RESET_GEN_SHIFT) & GM_FLAG_RESET_GEN_MASK,
+                    "bumped fog reset counter");
+
+            PollModeGmBlock();
 
             if (!_autoStartDone && _autoStartTracking.Value && !_losTrackingActive
                 && BoardSessionManager.Board != null)
@@ -671,7 +791,11 @@ namespace AutoHide
             if (_pendingInitialRefresh > 0 && --_pendingInitialRefresh == 0)
                 ForceLosRefresh();
 
-            if (_losTrackingActive) ProcessFogResults();
+            if (_losTrackingActive)
+            {
+                PollBoardChanges();
+                ProcessFogResults();
+            }
         }
 
         private void LogBoardHideVolumeCensus()
@@ -702,6 +826,236 @@ namespace AutoHide
                     Logger.LogInfo($"[AutoHide] [Census]   sample[{i}] bounds={volumes[i].Bounds} active={volumes[i].IsActive} hidePlaceables={volumes[i].HidePlaceables}");
             }
             catch (Exception ex) { Logger.LogWarning($"[AutoHide] [Census] {ex}"); }
+        }
+
+        // AtmosphereBlock.Content is declared, serialized and synced, but nothing in TaleSpire
+        // ever reads or writes it — the placer leaves it zeroed. That makes it 16 bytes of free
+        // board-persisted storage: three words of signature so we can recognise our own blocks,
+        // and one word of mode flags.
+        private const uint GM_BLOCK_SIG_X = 0xA07041DEu;
+        private const uint GM_BLOCK_SIG_Y = 0x8C3F5B12u;
+        private const uint GM_BLOCK_SIG_Z = 0x1F4E7A93u;
+
+        // Flags word layout: bits 0-7 are toggles, 8-11 the fog-reset generation, 12-31 spare.
+        // A "forget seen terrain" request is an event, not state, so it rides as a counter:
+        // clients act on a *change*, which makes it idempotent and correct for a client that
+        // joins after the GM pressed it. Four bits is ample — aliasing needs a client to be
+        // away for exactly 16 resets, and costs it one stale fog memory if it ever happens.
+        private const uint GM_FLAG_LOS = 1u << 0;
+        private const uint GM_FLAG_REMEMBER = 1u << 1;
+        private const int GM_FLAG_RESET_GEN_SHIFT = 8;
+        private const uint GM_FLAG_RESET_GEN_MASK = 0xFu << GM_FLAG_RESET_GEN_SHIFT;
+
+        // Set while a GM block dictates the mode, so the board's setting wins over the local one.
+        private static bool? _boardRememberOverride;
+        private bool _boardDrivenTracking;
+        private bool _haveResetGeneration;
+        private uint _lastResetGeneration;
+        private float _nextGmBlockPoll;
+
+        private static bool RememberSeenTerrain =>
+            _boardRememberOverride ?? _rememberSeenTerrain.Value;
+
+        private static bool IsAutoHideBlock(GmBlock block, out AtmosphereBlock atmos, out uint flags)
+        {
+            atmos = block as AtmosphereBlock;
+            flags = 0;
+            if (atmos == null) return false;
+            var d = atmos.Content.Data;
+            if (d.x != GM_BLOCK_SIG_X || d.y != GM_BLOCK_SIG_Y || d.z != GM_BLOCK_SIG_Z)
+                return false;
+            flags = d.w;
+            return true;
+        }
+
+        private static Dictionary<NGuid, GmBlock> GetBoardGmBlocks(Board board)
+        {
+            var field = typeof(Board).GetField("_gmBlocks",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            return field?.GetValue(board) as Dictionary<NGuid, GmBlock>;
+        }
+
+        private static NGuid MakeContent(uint flags) =>
+            new NGuid(new uint4(GM_BLOCK_SIG_X, GM_BLOCK_SIG_Y, GM_BLOCK_SIG_Z, flags));
+
+        private static bool TryGetAutoHideBlock(out AtmosphereBlock block, out uint flags)
+        {
+            block = null;
+            flags = 0;
+            var blocks = GetBoardGmBlocks(BoardSessionManager.Board);
+            if (blocks == null) return false;
+            foreach (var kv in blocks)
+                if (IsAutoHideBlock(kv.Value, out block, out flags)) return true;
+            block = null;
+            return false;
+        }
+
+        // The block's presence is the board setting: every client that has the plugin reads it
+        // straight off the synced data model, so no side-channel is needed to distribute it.
+        private void PollModeGmBlock()
+        {
+            if (Time.time < _nextGmBlockPoll) return;
+            _nextGmBlockPoll = Time.time + 0.5f;
+
+            if (BoardSessionManager.Board == null) return;
+
+            bool found = TryGetAutoHideBlock(out _, out var flags);
+            _boardRememberOverride = found ? (bool?)((flags & GM_FLAG_REMEMBER) != 0) : null;
+
+            if (!found)
+            {
+                _haveResetGeneration = false;
+            }
+            else
+            {
+                uint gen = (flags & GM_FLAG_RESET_GEN_MASK) >> GM_FLAG_RESET_GEN_SHIFT;
+                if (!_haveResetGeneration)
+                {
+                    // First sighting only records where the counter stands — a client that
+                    // joins later must not replay a reset the party already went through.
+                    _haveResetGeneration = true;
+                    _lastResetGeneration = gen;
+                }
+                else if (gen != _lastResetGeneration)
+                {
+                    _lastResetGeneration = gen;
+                    Logger.LogInfo($"[AutoHide] [GmBlock] Reset counter now {gen} — forgetting seen terrain.");
+                    ForgetSeenTerrain();
+                }
+            }
+
+            // A GM in GM mode is meant to see everything, so the board setting only binds
+            // clients that are actually playing.
+            bool shouldTrack = found && (flags & GM_FLAG_LOS) != 0 && !LocalClient.IsInGmMode;
+            if (shouldTrack == _boardDrivenTracking) return;
+
+            _boardDrivenTracking = shouldTrack;
+            Logger.LogInfo($"[AutoHide] [GmBlock] Board {(shouldTrack ? "requires" : "releases")} LoS mode.");
+            SetLosTracking(shouldTrack, switchClientMode: false);
+        }
+
+        private void ForgetSeenTerrain()
+        {
+            if (!_losTrackingActive) return;
+            RemoveAllZoneHideVolumes();
+            ForceLosRefresh();
+        }
+
+        private void SetGmBlockFlags(Func<uint, uint> mutate, string what)
+        {
+            try
+            {
+                var board = BoardSessionManager.Board;
+                if (board == null) { Logger.LogInfo("[AutoHide] [GmBlock] No board."); return; }
+                if (!TryGetAutoHideBlock(out var block, out var flags))
+                { Logger.LogInfo("[AutoHide] [GmBlock] No AutoHide block on this board."); return; }
+
+                uint next = mutate(flags);
+                board.SetGmBlockState(new AtmosphereBlock
+                {
+                    Id = block.Id,
+                    Position = block.Position,
+                    Content = MakeContent(next),
+                    Data = block.Data,
+                });
+                Logger.LogInfo($"[AutoHide] [GmBlock] {what}: flags 0x{flags:X8} -> 0x{next:X8}");
+            }
+            catch (Exception ex) { Logger.LogWarning($"[AutoHide] [GmBlock] {ex}"); }
+        }
+
+        private void ToggleAutoHideGmBlock()
+        {
+            try
+            {
+                var board = BoardSessionManager.Board;
+                if (board == null) { Logger.LogInfo("[AutoHide] [GmBlock] No board."); return; }
+
+                var blocks = GetBoardGmBlocks(board);
+                if (blocks == null) { Logger.LogWarning("[AutoHide] [GmBlock] Board._gmBlocks not found."); return; }
+
+                foreach (var kv in new List<KeyValuePair<NGuid, GmBlock>>(blocks))
+                {
+                    if (!IsAutoHideBlock(kv.Value, out _, out _)) continue;
+                    board.RemoveGmBlock(kv.Key);
+                    Logger.LogInfo($"[AutoHide] [GmBlock] Removed existing AutoHide block {kv.Key}");
+                    return;
+                }
+
+                if (!CreaturePresenter.TryGetAsset(LocalClient.SelectedCreatureId, out var asset) || asset == null)
+                { Logger.LogInfo("[AutoHide] [GmBlock] No selected creature to place at."); return; }
+
+                var pos = asset.transform.position;
+                var block = new AtmosphereBlock
+                {
+                    Id = new NGuid(System.Guid.NewGuid()),
+                    Position = new float3(pos.x, pos.y, pos.z),
+                    Content = MakeContent(GM_FLAG_LOS | (_rememberSeenTerrain.Value ? GM_FLAG_REMEMBER : 0u)),
+                    // Seed from the live atmosphere so triggering the block is a visual no-op.
+                    Data = AtmosphereManager.Instance.GetAtmosphere(),
+                };
+                board.AddGmBlock(block);
+                Logger.LogInfo($"[AutoHide] [GmBlock] Placed AutoHide block {block.Id} at {block.Position}");
+            }
+            catch (Exception ex) { Logger.LogWarning($"[AutoHide] [GmBlock] {ex}"); }
+        }
+
+        private void LogGmBlockCensus()
+        {
+            try
+            {
+                var board = BoardSessionManager.Board;
+                if (board == null) { Logger.LogInfo("[AutoHide] [GmCensus] No board."); return; }
+
+                var blocks = GetBoardGmBlocks(board);
+                if (blocks == null) { Logger.LogWarning("[AutoHide] [GmCensus] Board._gmBlocks not found."); return; }
+
+                Logger.LogInfo($"[AutoHide] [GmCensus] Board carries {blocks.Count} GM block(s)");
+                foreach (var kv in blocks)
+                {
+                    bool ours = IsAutoHideBlock(kv.Value, out var atmos, out var flags);
+                    string content = atmos != null ? atmos.Content.Data.ToString() : "n/a";
+                    Logger.LogInfo($"[AutoHide] [GmCensus]   {kv.Value.GetType().Name} id={kv.Key} "
+                        + $"pos={kv.Value.GetPosition()} ours={ours} flags=0x{flags:X8} content={content}");
+                }
+
+                LogGmBlockPresentation();
+            }
+            catch (Exception ex) { Logger.LogWarning($"[AutoHide] [GmCensus] {ex}"); }
+        }
+
+        // Whether a GM block is visible to a player is decided by the Unity layer its presentation
+        // object sits on versus the camera's culling mask — neither is visible in decompiled C#.
+        private void LogGmBlockPresentation()
+        {
+            try
+            {
+                var mgr = GmBlockManager.Instance;
+                var field = typeof(GmBlockManager).GetField("_blocksBases",
+                    BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                var bases = field?.GetValue(mgr) as System.Collections.IEnumerable;
+                if (bases == null) { Logger.LogWarning("[AutoHide] [GmVis] _blocksBases not found."); return; }
+
+                int n = 0;
+                foreach (var b in bases)
+                {
+                    var comp = b as Component;
+                    if (comp == null) continue;
+                    var go = comp.gameObject;
+                    Logger.LogInfo($"[AutoHide] [GmVis]   base[{n++}] name={go.name} active={go.activeInHierarchy} "
+                        + $"layer={go.layer}({LayerMask.LayerToName(go.layer)}) pos={comp.transform.position}");
+                    foreach (var r in comp.GetComponentsInChildren<Renderer>(true))
+                        Logger.LogInfo($"[AutoHide] [GmVis]     renderer {r.name} enabled={r.enabled} "
+                            + $"activeInHierarchy={r.gameObject.activeInHierarchy} layer={r.gameObject.layer}({LayerMask.LayerToName(r.gameObject.layer)})");
+                }
+                if (n == 0) Logger.LogInfo("[AutoHide] [GmVis]   no presentation objects");
+
+                var cam = Camera.main;
+                if (cam != null)
+                    Logger.LogInfo($"[AutoHide] [GmVis] Camera.main={cam.name} cullingMask=0x{cam.cullingMask:X8}");
+                foreach (var c in Camera.allCameras)
+                    Logger.LogInfo($"[AutoHide] [GmVis]   camera {c.name} enabled={c.enabled} cullingMask=0x{c.cullingMask:X8}");
+            }
+            catch (Exception ex) { Logger.LogWarning($"[AutoHide] [GmVis] {ex}"); }
         }
 
         // Recovery for boards polluted by an earlier build of this plugin, which published its
