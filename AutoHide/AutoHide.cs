@@ -5,8 +5,11 @@ using Bounce.Unmanaged;
 using DataModel;
 using HarmonyLib;
 using PluginUtilities;
+using RadialUI;
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
 using System.Reflection;
 using Unity.Collections;
 using Unity.Jobs;
@@ -17,6 +20,7 @@ namespace AutoHide
 {
     [BepInPlugin(Guid, PluginName, Version)]
     [BepInDependency(SetInjectionFlag.Guid)]
+    [BepInDependency(RadialUIPlugin.Guid)]
     public class AutoHidePlugin : DependencyUnityPlugin<AutoHidePlugin>
     {
         public const string PluginName = "AutoHide Diagnostic Plugin";
@@ -32,10 +36,8 @@ namespace AutoHide
         private static ConfigEntry<bool> _rememberSeenTerrain;
         private ConfigEntry<KeyboardShortcut> _boardVolumeCensusKey;
         private ConfigEntry<KeyboardShortcut> _boardVolumePurgeKey;
-        private ConfigEntry<KeyboardShortcut> _gmBlockToggleKey;
+        private ConfigEntry<KeyboardShortcut> _gmBlockPlaceKey;
         private ConfigEntry<KeyboardShortcut> _gmBlockCensusKey;
-        private ConfigEntry<KeyboardShortcut> _gmBlockMemoryKey;
-        private ConfigEntry<KeyboardShortcut> _gmBlockFogResetKey;
 
         private Harmony _harmony;
 
@@ -59,6 +61,15 @@ namespace AutoHide
         private static readonly bool[] _cellFogged = new bool[ZONE_CELLS * ZONE_CELLS * ZONE_CELLS];
         private static readonly bool[] _cellScratch = new bool[ZONE_CELLS * ZONE_CELLS * ZONE_CELLS];
         private static readonly Dictionary<short3, List<HideVolume>> _zoneHideVolumes = new Dictionary<short3, List<HideVolume>>();
+
+        // Seen-terrain memory is written to disk per board so it survives a restart.
+        private const uint FOG_FILE_MAGIC = 0x48464741; // "AGFH"
+        private const int FOG_FILE_VERSION = 1;
+        private const float FOG_SAVE_INTERVAL = 15f;
+        private static string _fogBoardKey;
+        private static bool _fogDirty;
+        private float _nextFogSave;
+
         private static int _rebuildLogCount;
         private int _pendingInitialRefresh;
         private int _lastBoardEventCounter;
@@ -128,19 +139,13 @@ namespace AutoHide
                 + "Recovery tool for a board polluted by an earlier build of this plugin — it also "
                 + "deletes hand-placed hide volumes, so it ships unbound.");
 
-            // The GM block is the board-level switch: while one is present, every client with
-            // the plugin runs line-of-sight hiding, with no per-player toggling.
-            _gmBlockToggleKey = Config.Bind("Controls", "GmBlockToggle",
-                new KeyboardShortcut(KeyCode.G, KeyCode.LeftControl),
-                "Arm or disarm line-of-sight hiding for the whole board, by placing or removing an "
-                + "AutoHide GM block at the selected creature. GM only — it writes to the board.");
-            _gmBlockMemoryKey = Config.Bind("Controls", "GmBlockToggleMemory",
-                new KeyboardShortcut(KeyCode.M, KeyCode.LeftControl),
-                "Flip the seen-terrain memory flag on the AutoHide GM block, for every client on the board");
-            _gmBlockFogResetKey = Config.Bind("Controls", "GmBlockResetFog",
-                new KeyboardShortcut(KeyCode.B, KeyCode.LeftControl),
-                "Forget all seen terrain on every client on the board, by bumping the reset counter "
-                + "on the AutoHide GM block");
+            // The board-level switch lives on the GM block's radial menu, not on a key: it is set
+            // once per map, and the fog reset behind it is destructive enough that a stray
+            // keystroke must not be able to reach it.
+            _gmBlockPlaceKey = Config.Bind("Diagnostics", "GmBlockPlace",
+                KeyboardShortcut.Empty,
+                "Place or remove an AutoHide GM block at the selected creature, bypassing the radial "
+                + "menu. A test hook for automation — GMs should use the atmosphere block's menu.");
 
             _gmBlockCensusKey = Config.Bind("Diagnostics", "GmBlockCensus",
                 KeyboardShortcut.Empty,
@@ -149,8 +154,8 @@ namespace AutoHide
             _rememberSeenTerrain = Config.Bind("Behaviour", "RememberSeenTerrain", true,
                 "Keep terrain visible once it has been seen, the way fog of war does, instead of "
                 + "re-hiding it when it leaves line of sight. Creatures are unaffected — TaleSpire "
-                + "hides those by its own line of sight. Memory is discarded when tracking is "
-                + "switched off.");
+                + "hides those by its own line of sight. What has been seen is saved per board "
+                + "under BepInEx/AutoHide and restored on the next session.");
 
             _autoStartTracking = Config.Bind("Diagnostics", "AutoStartTracking", false,
                 "Start LoS tracking automatically once a board is loaded, without needing a keypress. "
@@ -161,6 +166,7 @@ namespace AutoHide
             _harmony.PatchAll();
 
             SetupFogMaskReflection();
+            RegisterRadialMenu();
 
             Logger.LogInfo($"[AutoHide] Plugin loaded. Toggle={_toggleTrackingKey.Value} StaticHV={_staticHideVolumeKey.Value} AutoStart={_autoStartTracking.Value}");
         }
@@ -331,7 +337,11 @@ namespace AutoHide
                         changed = true;
                     }
 
-                    if (changed) _dirtyZones.Add(zone.Coord);
+                    if (changed)
+                    {
+                        _dirtyZones.Add(zone.Coord);
+                        if (remember) _fogDirty = true;
+                    }
                 }
             }
             catch (Exception ex)
@@ -342,6 +352,7 @@ namespace AutoHide
 
         protected override void OnDestroyed()
         {
+            SaveFogMemory();
             // Zone.CollectDataForSector serialises _localHideVolumes, so any volume left
             // behind here would get written into the board's saved sector data.
             RemoveAllZoneHideVolumes();
@@ -422,6 +433,7 @@ namespace AutoHide
                 {
                     if (!_losTrackingActive) return;
                     _losTrackingActive = false;
+                    SaveFogMemory();
                     RemoveAllZoneHideVolumes();
                     if (switchClientMode) SwitchToGMMode();
                     Logger.LogInfo($"[AutoHide] [LoS] Tracking OFF — hide volumes removed{(switchClientMode ? ", restored GM mode" : "")}.");
@@ -436,6 +448,7 @@ namespace AutoHide
                     EnsureHvManager();
                     EnsureFogMaskManager();
                     _lastBoardEventCounter = BoardSessionManager.Board?.SyncworthyGameEventsCounter ?? 0;
+                    LoadFogMemory();
                     if (switchClientMode) SwitchToPlayerMode();
                     Logger.LogInfo($"[AutoHide] [LoS] Tracking ON{(switchClientMode ? " — switched to player view" : "")} for LoS tile hiding.");
                     _pendingInitialRefresh = 10;
@@ -767,15 +780,10 @@ namespace AutoHide
             if (_probeRefreshKey.Value.IsDown()) ProbeRefresh();
             if (_boardVolumeCensusKey.Value.IsDown()) LogBoardHideVolumeCensus();
             if (_boardVolumePurgeKey.Value.IsDown()) PurgeBoardHideVolumes();
-            if (_gmBlockToggleKey.Value.IsDown()) ToggleAutoHideGmBlock();
+            if (_gmBlockPlaceKey.Value.IsDown()) ToggleAutoHideGmBlock();
             if (_gmBlockCensusKey.Value.IsDown()) LogGmBlockCensus();
-            if (_gmBlockMemoryKey.Value.IsDown())
-                SetGmBlockFlags(f => f ^ GM_FLAG_REMEMBER, "toggled seen-terrain memory");
-            if (_gmBlockFogResetKey.Value.IsDown())
-                SetGmBlockFlags(f => (f & ~GM_FLAG_RESET_GEN_MASK)
-                    | ((((f & GM_FLAG_RESET_GEN_MASK) >> GM_FLAG_RESET_GEN_SHIFT) + 1) << GM_FLAG_RESET_GEN_SHIFT) & GM_FLAG_RESET_GEN_MASK,
-                    "bumped fog reset counter");
 
+            PollBoardIdentity();
             PollModeGmBlock();
 
             if (!_autoStartDone && _autoStartTracking.Value && !_losTrackingActive
@@ -795,7 +803,26 @@ namespace AutoHide
             {
                 PollBoardChanges();
                 ProcessFogResults();
+
+                if (_fogDirty && Time.time >= _nextFogSave)
+                {
+                    _nextFogSave = Time.time + FOG_SAVE_INTERVAL;
+                    SaveFogMemory();
+                }
             }
+        }
+
+        // Memory belongs to the board it was built on, so it is flushed before the key changes
+        // and reloaded against the new one.
+        private void PollBoardIdentity()
+        {
+            string key = CurrentBoardKey();
+            if (key == _fogBoardKey) return;
+
+            SaveFogMemory();
+            _fogBoardKey = key;
+            RemoveAllZoneHideVolumes();
+            if (_losTrackingActive) LoadFogMemory();
         }
 
         private void LogBoardHideVolumeCensus()
@@ -936,10 +963,154 @@ namespace AutoHide
 
         private void ForgetSeenTerrain()
         {
+            DeleteFogMemory();
             if (!_losTrackingActive) return;
             RemoveAllZoneHideVolumes();
             ForceLosRefresh();
         }
+
+        // RadialUI only ever assigns ItemArgs.Obj once, so it is stale from the second block
+        // onwards. The visibility predicate, by contrast, runs on every menu open with the live
+        // block — so that is where we capture which block the menu belongs to, and where the
+        // labels get refreshed to match its current flags.
+        private static AtmosphereBlock _radialBlock;
+
+        private void RegisterRadialMenu()
+        {
+            // The menu paints ValueText/SubValueText on the button face and only fades Title in
+            // on hover, so the state belongs in the value and the explanation in the title.
+            var toggle = new MapMenu.ItemArgs { ValueText = "AutoHide", CloseMenuOnActivate = true };
+            toggle.Action = (mmi, obj) =>
+            {
+                var block = _radialBlock;
+                if (block == null) return;
+                if (IsAutoHideBlock(block, out _, out _)) ReleaseAutoHideBlock(block);
+                else AdoptAutoHideBlock(block);
+            };
+            RadialUIPlugin.AddCustomButtonGMBlock("AutoHide.Toggle", toggle, block =>
+            {
+                _radialBlock = block;
+                bool ours = block != null && IsAutoHideBlock(block, out _, out _);
+                toggle.SubValueText = ours ? "on" : "off";
+                toggle.Title = ours
+                    ? "Stop hiding what players cannot see"
+                    : "Hide what players cannot see, for everyone on this board";
+                return true;
+            });
+
+            var memory = new MapMenu.ItemArgs { ValueText = "Fog", CloseMenuOnActivate = true };
+            memory.Action = (mmi, obj) =>
+                SetGmBlockFlags(f => f ^ GM_FLAG_REMEMBER, "toggled seen-terrain memory");
+            RadialUIPlugin.AddCustomButtonGMBlock("AutoHide.Memory", memory, block =>
+            {
+                if (block == null || !IsAutoHideBlock(block, out _, out var flags)) return false;
+                bool remember = (flags & GM_FLAG_REMEMBER) != 0;
+                memory.SubValueText = remember ? "on" : "off";
+                memory.Title = remember
+                    ? "Re-hide terrain as soon as it leaves sight"
+                    : "Keep explored terrain visible once seen";
+                return true;
+            });
+
+            // Wiping the party's map memory is not undoable, so it costs two clicks.
+            // The button face wraps at about five characters, so the words have to stay short.
+            var forget = new MapMenu.ItemArgs
+            {
+                ValueText = "Reset",
+                SubValueText = "fog",
+                Title = "Make everyone re-explore the map",
+                CloseMenuOnActivate = false,
+            };
+            forget.Action = (mmi, obj) => OpenForgetConfirmation();
+            RadialUIPlugin.AddCustomButtonGMBlock("AutoHide.Forget", forget, block =>
+            {
+                if (block == null || !IsAutoHideBlock(block, out _, out var flags)) return false;
+                return (flags & GM_FLAG_REMEMBER) != 0;
+            });
+        }
+
+        private void OpenForgetConfirmation()
+        {
+            try
+            {
+                var interact = GMBlockInteractMenuBoardTool.block;
+                Vector3 pos = interact != null ? (Vector3)interact.WorldPosition
+                    : _radialBlock != null ? (Vector3)_radialBlock.Position
+                    : Vector3.zero;
+
+                var menu = MapMenuManager.OpenMenu(pos, true);
+                menu.AddItem(new MapMenu.ItemArgs
+                {
+                    ValueText = "Yes",
+                    SubValueText = "reset",
+                    Title = "Yes — every player re-explores the map",
+                    CloseMenuOnActivate = true,
+                    Action = (mmi, obj) => SetGmBlockFlags(NextResetGeneration, "bumped fog reset counter"),
+                });
+                menu.AddItem(new MapMenu.ItemArgs
+                {
+                    ValueText = "No",
+                    SubValueText = "keep",
+                    Title = "Leave the explored map alone",
+                    CloseMenuOnActivate = true,
+                    Action = (mmi, obj) => { },
+                });
+            }
+            catch (Exception ex) { Logger.LogWarning($"[AutoHide] [GmBlock] {ex}"); }
+        }
+
+        private static uint NextResetGeneration(uint flags)
+        {
+            uint gen = ((flags & GM_FLAG_RESET_GEN_MASK) >> GM_FLAG_RESET_GEN_SHIFT) + 1;
+            return (flags & ~GM_FLAG_RESET_GEN_MASK)
+                | ((gen << GM_FLAG_RESET_GEN_SHIFT) & GM_FLAG_RESET_GEN_MASK);
+        }
+
+        private void AdoptAutoHideBlock(AtmosphereBlock block)
+        {
+            try
+            {
+                var board = BoardSessionManager.Board;
+                if (board == null) { Logger.LogInfo("[AutoHide] [GmBlock] No board."); return; }
+
+                // One switch per board: adopting a new block demotes the old one rather than
+                // leaving two blocks that disagree about the mode.
+                var blocks = GetBoardGmBlocks(board);
+                if (blocks != null)
+                    foreach (var kv in new List<KeyValuePair<NGuid, GmBlock>>(blocks))
+                        if (IsAutoHideBlock(kv.Value, out var other, out _) && !other.Id.Equals(block.Id))
+                            WriteBlockContent(board, other, default(NGuid));
+
+                WriteBlockContent(board, block,
+                    MakeContent(GM_FLAG_LOS | (_rememberSeenTerrain.Value ? GM_FLAG_REMEMBER : 0u)));
+                Logger.LogInfo($"[AutoHide] [GmBlock] Block {block.Id} is now the board's AutoHide switch.");
+            }
+            catch (Exception ex) { Logger.LogWarning($"[AutoHide] [GmBlock] {ex}"); }
+        }
+
+        private void ReleaseAutoHideBlock(AtmosphereBlock block)
+        {
+            try
+            {
+                var board = BoardSessionManager.Board;
+                if (board == null) { Logger.LogInfo("[AutoHide] [GmBlock] No board."); return; }
+
+                // Clearing the signature leaves an ordinary atmosphere block behind, which the GM
+                // can keep or delete with TaleSpire's own controls.
+                WriteBlockContent(board, block, default(NGuid));
+                Logger.LogInfo($"[AutoHide] [GmBlock] Block {block.Id} released — board no longer enforces line of sight.");
+            }
+            catch (Exception ex) { Logger.LogWarning($"[AutoHide] [GmBlock] {ex}"); }
+        }
+
+        private static void WriteBlockContent(Board board, AtmosphereBlock block, NGuid content) =>
+            board.SetGmBlockState(new AtmosphereBlock
+            {
+                Id = block.Id,
+                Position = block.Position,
+                Content = content,
+                Data = block.Data,
+            });
 
         private void SetGmBlockFlags(Func<uint, uint> mutate, string what)
         {
@@ -951,13 +1122,7 @@ namespace AutoHide
                 { Logger.LogInfo("[AutoHide] [GmBlock] No AutoHide block on this board."); return; }
 
                 uint next = mutate(flags);
-                board.SetGmBlockState(new AtmosphereBlock
-                {
-                    Id = block.Id,
-                    Position = block.Position,
-                    Content = MakeContent(next),
-                    Data = block.Data,
-                });
+                WriteBlockContent(board, block, MakeContent(next));
                 Logger.LogInfo($"[AutoHide] [GmBlock] {what}: flags 0x{flags:X8} -> 0x{next:X8}");
             }
             catch (Exception ex) { Logger.LogWarning($"[AutoHide] [GmBlock] {ex}"); }
@@ -1223,6 +1388,136 @@ namespace AutoHide
             return true;
         }
 
+        private static string FogDirectory => Path.Combine(Paths.BepInExRootPath, "AutoHide");
+
+        private static string FogFilePath(string boardKey) =>
+            Path.Combine(FogDirectory, boardKey + ".fog");
+
+        // The board id comes from the backend, so it is sanitised before it reaches the filesystem.
+        private static string CurrentBoardKey()
+        {
+            if (BoardSessionManager.Board == null) return null;
+            string id = BoardSessionManager.CurrentBoardInfo.Id.ToString();
+            if (string.IsNullOrEmpty(id)) return null;
+
+            var sb = new System.Text.StringBuilder(id.Length);
+            foreach (char c in id)
+                sb.Append(char.IsLetterOrDigit(c) || c == '-' ? c : '_');
+            return sb.ToString();
+        }
+
+        private static void LoadFogMemory()
+        {
+            if (_fogBoardKey == null || !RememberSeenTerrain) return;
+
+            string path = FogFilePath(_fogBoardKey);
+            if (!File.Exists(path)) return;
+
+            try
+            {
+                int zones = 0;
+                using (var file = File.OpenRead(path))
+                using (var gz = new GZipStream(file, CompressionMode.Decompress))
+                using (var reader = new BinaryReader(gz))
+                {
+                    if (reader.ReadUInt32() != FOG_FILE_MAGIC || reader.ReadInt32() != FOG_FILE_VERSION)
+                    {
+                        _log?.LogWarning($"[AutoHide] [Fog] {path} is not a readable AutoHide fog file — ignoring it.");
+                        return;
+                    }
+
+                    int count = reader.ReadInt32();
+                    lock (_zoneMasks)
+                    {
+                        for (int i = 0; i < count; i++)
+                        {
+                            var coord = new short3(reader.ReadInt16(), reader.ReadInt16(), reader.ReadInt16());
+                            var buf = new ushort[MASK_LENGTH];
+                            for (int j = 0; j < MASK_LENGTH; j++) buf[j] = reader.ReadUInt16();
+                            _zoneMasks[coord] = buf;
+                            // Restored zones still need their boxes built, or the terrain the
+                            // party explored last session would come back visible.
+                            _dirtyZones.Add(coord);
+                            zones++;
+                        }
+                    }
+                }
+
+                _fogDirty = false;
+                _log?.LogInfo($"[AutoHide] [Fog] Restored {zones} zone(s) of seen terrain for board {_fogBoardKey}.");
+            }
+            catch (Exception ex)
+            {
+                _log?.LogWarning($"[AutoHide] [Fog] Could not read {path}: {ex.Message}");
+                lock (_zoneMasks)
+                {
+                    _zoneMasks.Clear();
+                    _dirtyZones.Clear();
+                }
+            }
+        }
+
+        private static void SaveFogMemory()
+        {
+            if (_fogBoardKey == null || !_fogDirty || !RememberSeenTerrain) return;
+
+            List<KeyValuePair<short3, ushort[]>> snapshot;
+            lock (_zoneMasks)
+            {
+                snapshot = new List<KeyValuePair<short3, ushort[]>>(_zoneMasks.Count);
+                foreach (var kv in _zoneMasks)
+                {
+                    var copy = new ushort[MASK_LENGTH];
+                    Array.Copy(kv.Value, copy, MASK_LENGTH);
+                    snapshot.Add(new KeyValuePair<short3, ushort[]>(kv.Key, copy));
+                }
+            }
+
+            string path = FogFilePath(_fogBoardKey);
+            try
+            {
+                Directory.CreateDirectory(FogDirectory);
+                using (var file = File.Create(path))
+                using (var gz = new GZipStream(file, CompressionMode.Compress))
+                using (var writer = new BinaryWriter(gz))
+                {
+                    writer.Write(FOG_FILE_MAGIC);
+                    writer.Write(FOG_FILE_VERSION);
+                    writer.Write(snapshot.Count);
+                    foreach (var kv in snapshot)
+                    {
+                        writer.Write(kv.Key.x);
+                        writer.Write(kv.Key.y);
+                        writer.Write(kv.Key.z);
+                        for (int j = 0; j < MASK_LENGTH; j++) writer.Write(kv.Value[j]);
+                    }
+                }
+
+                _fogDirty = false;
+                _log?.LogInfo($"[AutoHide] [Fog] Saved {snapshot.Count} zone(s) of seen terrain for board {_fogBoardKey}.");
+            }
+            catch (Exception ex)
+            {
+                _log?.LogWarning($"[AutoHide] [Fog] Could not write {path}: {ex.Message}");
+            }
+        }
+
+        private static void DeleteFogMemory()
+        {
+            _fogDirty = false;
+            if (_fogBoardKey == null) return;
+
+            string path = FogFilePath(_fogBoardKey);
+            try
+            {
+                if (File.Exists(path)) File.Delete(path);
+            }
+            catch (Exception ex)
+            {
+                _log?.LogWarning($"[AutoHide] [Fog] Could not delete {path}: {ex.Message}");
+            }
+        }
+
         private static void RemoveAllZoneHideVolumes()
         {
             var board = BoardSessionManager.Board;
@@ -1241,7 +1536,7 @@ namespace AutoHide
                 _zoneMasks.Clear();
                 _dirtyZones.Clear();
             }
-            _log?.LogInfo($"[AutoHide] [LoS] Removed {removed} hide volumes.");
+            if (removed > 0) _log?.LogInfo($"[AutoHide] [LoS] Removed {removed} hide volumes.");
         }
 
     }
